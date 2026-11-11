@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 from cryptography import x509
-
+from cryptography.hazmat.primitives import serialization
 import josepy as jose
 import pytest
 import requests
@@ -23,7 +23,6 @@ from acme._internal.tests import test_util
 from acme.client import ClientNetwork
 from acme.client import ClientV2
 
-CERT_SAN_PEM = test_util.load_vector('cert-san.pem')
 CSR_MIXED_PEM = test_util.load_vector('csr-mixed.pem')
 CSR_NO_SANS_PEM = test_util.load_vector('csr-nosans.pem')
 KEY = jose.JWKRSA.load(test_util.load_vector('rsa512_key.pem'))
@@ -103,6 +102,26 @@ class ClientV2Test(unittest.TestCase):
             body=self.order,
             uri='https://www.letsencrypt-demo.org/acme/acct/1/order/1',
             authorizations=[self.authzr, self.authzr2], csr_pem=CSR_NO_SANS_PEM)
+
+        # Locally generated, short-lived issuance fixtures whose leaf cert
+        # matches a CSR, used by the issuance result validation tests.
+        self.issuer_key = test_util.generate_test_key()
+        self.issuer_cert = test_util.generate_test_issuer(self.issuer_key)
+        self.leaf_key = test_util.generate_test_key()
+        self.matching_csr = test_util.generate_test_csr(
+            self.leaf_key, dns_names=['example.com', 'www.example.com'])
+        self.matching_csr_pem = self.matching_csr.public_bytes(
+            serialization.Encoding.PEM)
+        self.matching_leaf = test_util.generate_test_cert(
+            self.leaf_key, dns_names=['example.com', 'www.example.com'],
+            issuer_key=self.issuer_key, serial=4242)
+        self.matching_fullchain_pem = test_util.cert_chain_pem(
+            [self.matching_leaf, self.issuer_cert])
+        self.valid_orderr = messages.OrderResource(
+            body=self.order,
+            uri='https://www.letsencrypt-demo.org/acme/acct/1/order/1',
+            authorizations=[self.authzr, self.authzr2],
+            csr_pem=self.matching_csr_pem)
 
     def test_new_account(self):
         self.response.status_code = http_client.CREATED
@@ -237,13 +256,15 @@ class ClientV2Test(unittest.TestCase):
         updated_order = self.order.update(
             certificate='https://www.letsencrypt-demo.org/acme/cert/',
             status=messages.STATUS_VALID)
-        updated_orderr = self.orderr.update(body=updated_order, fullchain_pem=CERT_SAN_PEM)
+        updated_orderr = self.valid_orderr.update(
+            body=updated_order, fullchain_pem=self.matching_fullchain_pem)
 
         self.response.json.return_value = updated_order.to_json()
-        self.response.text = CERT_SAN_PEM
+        self.response.text = self.matching_fullchain_pem
 
         deadline = datetime.datetime(9999, 9, 9)
-        assert self.client.finalize_order(self.orderr, deadline) == updated_orderr
+        assert self.client.finalize_order(
+            self.valid_orderr, deadline) == updated_orderr
 
     def test_finalize_order_error(self):
         updated_order = self.order.update(
@@ -263,15 +284,18 @@ class ClientV2Test(unittest.TestCase):
         updated_order_valid = self.order.update(
             certificate='https://www.letsencrypt-demo.org/acme/cert/',
             status=messages.STATUS_VALID)
-        updated_orderr = self.orderr.update(body=updated_order_valid, fullchain_pem=CERT_SAN_PEM)
+        updated_orderr = self.valid_orderr.update(
+            body=updated_order_valid,
+            fullchain_pem=self.matching_fullchain_pem)
 
-        self.response.text = CERT_SAN_PEM
+        self.response.text = self.matching_fullchain_pem
 
         self.response.json.side_effect = [updated_order_ready.to_json(),
                                            updated_order_valid.to_json()]
 
         deadline = datetime.datetime(9999, 9, 9)
-        assert self.client.finalize_order(self.orderr, deadline) == updated_orderr
+        assert self.client.finalize_order(
+            self.valid_orderr, deadline) == updated_orderr
         assert self.response.json.call_count == 2
         assert mock_begin.call_count == 2
 
@@ -292,9 +316,10 @@ class ClientV2Test(unittest.TestCase):
         updated_order_valid = self.order.update(
             certificate='https://www.letsencrypt-demo.org/acme/cert/',
             status=messages.STATUS_VALID)
-        self.orderr.update(body=updated_order_valid, fullchain_pem=CERT_SAN_PEM)
+        self.valid_orderr.update(
+            body=updated_order_valid, fullchain_pem=self.matching_fullchain_pem)
 
-        self.response.text = CERT_SAN_PEM
+        self.response.text = self.matching_fullchain_pem
 
         self.response.json.side_effect = [updated_order_processing.to_json(),
                                           updated_order_ready.to_json(),
@@ -317,7 +342,7 @@ class ClientV2Test(unittest.TestCase):
                             ]
         self.net.post = post
 
-        self.client.finalize_order(self.orderr, datetime.datetime(9999, 9, 9))
+        self.client.finalize_order(self.valid_orderr, datetime.datetime(9999, 9, 9))
         assert self.net.post.call_count == 6
         assert mock_sleep.call_args_list == [((1,),), ((50,),), ((1,),)]
 
@@ -339,18 +364,21 @@ class ClientV2Test(unittest.TestCase):
             certificate='https://www.letsencrypt-demo.org/acme/cert/',
             status=messages.STATUS_VALID
         )
-        updated_orderr = self.orderr.update(body=updated_order,
-                                            fullchain_pem=CERT_SAN_PEM,
-                                            alternative_fullchains_pem=[CERT_SAN_PEM,
-                                                                        CERT_SAN_PEM])
+        alt_fullchain_pem = test_util.cert_chain_pem(
+            [self.matching_leaf, self.issuer_cert])
+        updated_orderr = self.valid_orderr.update(
+            body=updated_order,
+            fullchain_pem=self.matching_fullchain_pem,
+            alternative_fullchains_pem=[alt_fullchain_pem, alt_fullchain_pem])
         self.response.json.return_value = updated_order.to_json()
-        self.response.text = CERT_SAN_PEM
+        self.response.text = self.matching_fullchain_pem
         self.response.headers['Link'] ='<https://example.com/acme/cert/1>;rel="alternate", ' + \
             '<https://example.com/dir>;rel="index", ' + \
             '<https://example.com/acme/cert/2>;title="foo";rel="alternate"'
 
         deadline = datetime.datetime(9999, 9, 9)
-        resp = self.client.finalize_order(self.orderr, deadline, fetch_alternative_chains=True)
+        resp = self.client.finalize_order(
+            self.valid_orderr, deadline, fetch_alternative_chains=True)
         self.net.post.assert_any_call('https://example.com/acme/cert/1',
                                       mock.ANY, new_nonce_url=mock.ANY)
         self.net.post.assert_any_call('https://example.com/acme/cert/2',
@@ -358,8 +386,138 @@ class ClientV2Test(unittest.TestCase):
         assert resp == updated_orderr
 
         del self.response.headers['Link']
-        resp = self.client.finalize_order(self.orderr, deadline, fetch_alternative_chains=True)
+        resp = self.client.finalize_order(
+            self.valid_orderr, deadline, fetch_alternative_chains=True)
         assert resp == updated_orderr.update(alternative_fullchains_pem=[])
+
+    def _make_valid_order_body(self):
+        return self.order.update(
+            certificate='https://www.letsencrypt-demo.org/acme/cert/',
+            status=messages.STATUS_VALID)
+
+    def _assert_issuance_validation_error(self, error):
+        # The failure must surface before any success result is returned and
+        # carry the order URI so operators can locate the affected order.
+        assert isinstance(error.value, errors.IssuanceValidationError)
+        assert error.value.order_uri == self.valid_orderr.uri
+        assert error.value.detail
+
+    def test_finalize_order_rejects_wrong_public_key(self):
+        # The server (or a mismatched order) returns a leaf certifying a
+        # different key pair than the CSR's public key.
+        other_key = test_util.generate_test_key()
+        wrong_key_cert = test_util.generate_test_cert(
+            other_key, dns_names=['example.com', 'www.example.com'],
+            issuer_key=self.issuer_key, serial=7)
+        wrong_fullchain = test_util.cert_chain_pem(
+            [wrong_key_cert, self.issuer_cert])
+
+        self.response.json.return_value = self._make_valid_order_body().to_json()
+        self.response.text = wrong_fullchain
+
+        with pytest.raises(errors.IssuanceValidationError) as error:
+            self.client.finalize_order(
+                self.valid_orderr, datetime.datetime(9999, 9, 9))
+        self._assert_issuance_validation_error(error)
+        assert 'public key' in str(error.value)
+
+    def test_finalize_order_rejects_wrong_sans(self):
+        # The public key matches but the leaf certifies identifiers that were
+        # not requested in the CSR.
+        wrong_san_cert = test_util.generate_test_cert(
+            self.leaf_key, dns_names=['example.com', 'evil.example'],
+            issuer_key=self.issuer_key, serial=8)
+        wrong_fullchain = test_util.cert_chain_pem(
+            [wrong_san_cert, self.issuer_cert])
+
+        self.response.json.return_value = self._make_valid_order_body().to_json()
+        self.response.text = wrong_fullchain
+
+        with pytest.raises(errors.IssuanceValidationError) as error:
+            self.client.finalize_order(
+                self.valid_orderr, datetime.datetime(9999, 9, 9))
+        self._assert_issuance_validation_error(error)
+        message = str(error.value)
+        assert 'identifiers' in message
+        assert 'evil.example' in message
+
+    def test_finalize_order_rejects_incomplete_pem(self):
+        # A truncated PEM block must not be silently accepted just because the
+        # leaf itself parses.
+        truncated_fullchain = self.matching_fullchain_pem + \
+            '-----BEGIN CERTIFICATE-----\nMIIBog==\n'
+
+        self.response.json.return_value = self._make_valid_order_body().to_json()
+        self.response.text = truncated_fullchain
+
+        with pytest.raises(errors.IssuanceValidationError) as error:
+            self.client.finalize_order(
+                self.valid_orderr, datetime.datetime(9999, 9, 9))
+        self._assert_issuance_validation_error(error)
+        assert 'PEM' in str(error.value)
+
+    def test_finalize_order_rejects_pem_without_cert(self):
+        self.response.json.return_value = self._make_valid_order_body().to_json()
+        self.response.text = 'no certificate here at all'
+
+        with pytest.raises(errors.IssuanceValidationError) as error:
+            self.client.finalize_order(
+                self.valid_orderr, datetime.datetime(9999, 9, 9))
+        self._assert_issuance_validation_error(error)
+
+    def test_finalize_order_rejects_alt_chain_with_swapped_leaf(self):
+        # The primary fullchain is valid, but the alternative chain carries a
+        # different leaf certificate (a different key pair).
+        other_key = test_util.generate_test_key()
+        swapped_leaf = test_util.generate_test_cert(
+            other_key, dns_names=['example.com', 'www.example.com'],
+            issuer_key=self.issuer_key, serial=9)
+        swapped_alt_chain = test_util.cert_chain_pem(
+            [swapped_leaf, self.issuer_cert])
+
+        alt_response = mock.MagicMock(ok=True, text=swapped_alt_chain)
+
+        def fake_post(url, *args, **kwargs):
+            if url == 'https://example.com/acme/cert/alt':
+                return alt_response
+            return self.response
+
+        self.response.json.return_value = self._make_valid_order_body().to_json()
+        self.response.text = self.matching_fullchain_pem
+        self.response.headers['Link'] = \
+            '<https://example.com/acme/cert/alt>;rel="alternate"'
+        self.net.post.side_effect = fake_post
+
+        with pytest.raises(errors.IssuanceValidationError) as error:
+            self.client.finalize_order(
+                self.valid_orderr, datetime.datetime(9999, 9, 9),
+                fetch_alternative_chains=True)
+        self._assert_issuance_validation_error(error)
+        assert 'alternative chain' in str(error.value)
+        assert 'leaf' in str(error.value)
+
+    def test_finalize_order_rejects_alt_chain_with_incomplete_pem(self):
+        bad_alt_chain = test_util.cert_chain_pem([self.matching_leaf]) + \
+            '-----BEGIN CERTIFICATE-----\nMIIBog==\n'
+        alt_response = mock.MagicMock(ok=True, text=bad_alt_chain)
+
+        def fake_post(url, *args, **kwargs):
+            if url == 'https://example.com/acme/cert/alt':
+                return alt_response
+            return self.response
+
+        self.response.json.return_value = self._make_valid_order_body().to_json()
+        self.response.text = self.matching_fullchain_pem
+        self.response.headers['Link'] = \
+            '<https://example.com/acme/cert/alt>;rel="alternate"'
+        self.net.post.side_effect = fake_post
+
+        with pytest.raises(errors.IssuanceValidationError) as error:
+            self.client.finalize_order(
+                self.valid_orderr, datetime.datetime(9999, 9, 9),
+                fetch_alternative_chains=True)
+        self._assert_issuance_validation_error(error)
+        assert 'alternative chain' in str(error.value)
 
     def test_revoke(self):
         self.client.revoke(messages_test.CERT, self.rsn)

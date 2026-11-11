@@ -3,6 +3,7 @@ import enum
 from datetime import datetime, timedelta, timezone
 import ipaddress
 import logging
+import re
 from types import ModuleType
 import typing
 from typing import Any
@@ -193,6 +194,163 @@ def get_identifiers_from_x509(
         # We only include the first CN, if there are multiple. This matches
         # the behavior of the previous implementation using pyOpenSSL.
         return [cns[0]] + [d for d in dns_names if d != cns[0]], ip_addresses
+
+
+# Matches a complete PEM certificate block, including its footer. Counting these
+# lets us detect truncated PEM blocks that x509.load_pem_x509_certificates
+# silently skips.
+_CERT_PEM_BLOCK_REGEX = re.compile(
+    b"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+    re.DOTALL,
+)
+_CERT_PEM_BEGIN_REGEX = re.compile(b"-----BEGIN CERTIFICATE-----")
+
+
+def _san_identifiers(
+    cert_or_req: Union[x509.Certificate, x509.CertificateSigningRequest],
+) -> tuple[
+    set[str],
+    set[Union[ipaddress.IPv4Address, ipaddress.IPv6Address,
+              ipaddress.IPv4Network, ipaddress.IPv6Network]],
+]:
+    """Extract the DNS and IP identifiers from the SAN extension.
+
+    Only the subjectAlternativeName extension is considered: the identifiers of
+    an ACME order are expressed in its CSR's SANs, and comparing SAN to SAN
+    avoids treating a subject Common Name as a requested identifier.
+
+    DNS names are normalized to lowercase with a single trailing dot removed,
+    and duplicate values collapse into the returned set. A leading wildcard
+    label ("*.") is preserved and normalized like any other label. IP
+    identifiers are returned as parsed address objects so equivalent textual
+    representations compare equal.
+    """
+    try:
+        san_ext = cert_or_req.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName)
+    except x509.ExtensionNotFound:
+        return set(), set()
+
+    dns_names = {_normalize_dns_name(name)
+                 for name in san_ext.value.get_values_for_type(x509.DNSName)}
+    ip_identifiers = set(
+        san_ext.value.get_values_for_type(x509.IPAddress))
+    return dns_names, ip_identifiers
+
+
+def _normalize_dns_name(name: str) -> str:
+    """Normalize a DNS name for comparison: lowercase, strip one trailing dot.
+
+    A wildcard label, if present, is kept as part of the name and only its
+    remaining labels are case-normalized, matching the textual form used in
+    ACME identifiers.
+    """
+    wildcard = name.startswith("*.")
+    if wildcard:
+        suffix = name[2:]
+    else:
+        suffix = name
+    suffix = suffix.lower()
+    if suffix.endswith("."):
+        suffix = suffix[:-1]
+    return "*." + suffix if wildcard else suffix
+
+
+def _public_key_der(key: Any) -> bytes:
+    return key.public_bytes(
+        Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
+def verify_csr_matches_cert(
+    csr: x509.CertificateSigningRequest,
+    cert: x509.Certificate,
+) -> None:
+    """Verify that an issued leaf certificate matches the requested CSR.
+
+    The check establishes the correspondence between the issuance result and
+    the order's CSR in two steps:
+
+    1. The certificate's SubjectPublicKeyInfo must equal the CSR's, i.e. the
+       same public key was certified.
+    2. The DNS and IP identifiers in the certificate's subjectAlternativeName
+       extension must equal those requested in the CSR's SAN extension.
+       Comparison is order-independent and duplicate-insensitive; DNS names
+       are case-folded with a trailing dot removed while wildcard labels are
+       preserved literally, and IP addresses are compared as parsed addresses.
+
+    :param csr: the CSR submitted when the order was created.
+    :param cert: the leaf certificate returned for the finalized order.
+
+    :raises ValueError: if the public key or the DNS/IP identifiers do not
+        match.
+    """
+    if _public_key_der(cert.public_key()) != _public_key_der(csr.public_key()):
+        raise ValueError(
+            "issued leaf certificate public key does not match the order's "
+            "CSR: the server returned a certificate for a different key pair")
+
+    csr_dns, csr_ips = _san_identifiers(csr)
+    cert_dns, cert_ips = _san_identifiers(cert)
+
+    if csr_dns != cert_dns or csr_ips != cert_ips:
+        missing_dns = sorted(csr_dns - cert_dns)
+        unexpected_dns = sorted(cert_dns - csr_dns)
+        missing_ips = sorted(str(ip) for ip in csr_ips - cert_ips)
+        unexpected_ips = sorted(str(ip) for ip in cert_ips - csr_ips)
+        problems = []
+        if missing_dns:
+            problems.append(f"missing DNS names {missing_dns}")
+        if unexpected_dns:
+            problems.append(f"unexpected DNS names {unexpected_dns}")
+        if missing_ips:
+            problems.append(f"missing IP addresses {missing_ips}")
+        if unexpected_ips:
+            problems.append(f"unexpected IP addresses {unexpected_ips}")
+        raise ValueError(
+            "issued leaf certificate identifiers do not match the order's "
+            "CSR SANs: " + "; ".join(problems))
+
+
+def load_fullchain_leaf(fullchain_pem: Union[str, bytes]) -> x509.Certificate:
+    """Parse a fullchain PEM bundle and return its leaf certificate.
+
+    Every PEM certificate block in the bundle must be complete and parseable:
+    a truncated block or a block that cannot be decoded raises ValueError
+    instead of being silently skipped, and a bundle without a leaf certificate
+    raises ValueError as well.
+
+    :param fullchain_pem: PEM-encoded certificate chain, leaf first.
+
+    :raises ValueError: if the bundle contains no parseable complete
+        certificate, or if a PEM block is truncated or otherwise invalid.
+    """
+    if isinstance(fullchain_pem, str):
+        fullchain_bytes = fullchain_pem.encode("utf-8")
+    else:
+        fullchain_bytes = fullchain_pem
+
+    block_count = len(_CERT_PEM_BLOCK_REGEX.findall(fullchain_bytes))
+    begin_count = len(_CERT_PEM_BEGIN_REGEX.findall(fullchain_bytes))
+    if begin_count == 0:
+        raise ValueError(
+            "certificate response did not contain any PEM certificate block")
+    if block_count != begin_count:
+        raise ValueError(
+            "certificate response contained an incomplete PEM certificate "
+            f"block: {begin_count} block(s) started but only {block_count} "
+            "were complete and parseable")
+
+    try:
+        certs = x509.load_pem_x509_certificates(fullchain_bytes)
+    except ValueError as error:
+        raise ValueError(
+            f"failed to parse certificate response PEM: {error}") from error
+    if not certs:
+        raise ValueError(
+            "certificate response did not contain a parseable leaf certificate")
+    return certs[0]
 
 
 def _cryptography_cert_or_req_san(

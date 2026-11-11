@@ -14,7 +14,7 @@ from typing import Optional
 from typing import Union
 
 from cryptography import x509
-
+from cryptography.hazmat.primitives import serialization
 import josepy as jose
 import requests
 from requests.adapters import HTTPAdapter
@@ -240,8 +240,19 @@ class ClientV2:
         poll until ready, send a new finalization request, and continue
         polling until valid as above.
 
+        Before the certificate is returned, the leaf certificate (and any
+        fetched alternative chains) is checked against the order's CSR:
+        it must carry the CSR's public key and the same DNS/IP identifiers,
+        and every alternative chain must present that same leaf certificate.
+        This verifies the correspondence between the issuance result and the
+        request only; it is not a CA root trust or revocation check.
+
         :returns: finalized order (with certificate)
         :rtype: messages.OrderResource
+
+        :raises errors.IssuanceValidationError: if the downloaded certificate
+            does not match the order's CSR, an alternative chain replaces the
+            leaf certificate, or a certificate response is not fully parseable
         """
         sleep_seconds: float = 1
         while datetime.datetime.now() < deadline:
@@ -268,10 +279,41 @@ class ClientV2:
                 # URL to the "certificate" field of the order.  Download the
                 # certificate.
                 certificate_response = self._post_as_get(body.certificate)
-                orderr = orderr.update(body=body, fullchain_pem=certificate_response.text)
+                fullchain_pem = certificate_response.text
+                # Verify that the issued leaf certificate corresponds to the
+                # CSR submitted for this order before the result is returned.
+                # This catches a mismatched order or a substituted certificate,
+                # but it is not a CA root trust or revocation check.
+                csr = x509.load_pem_x509_csr(orderr.csr_pem)
+                try:
+                    leaf = crypto_util.load_fullchain_leaf(fullchain_pem)
+                    crypto_util.verify_csr_matches_cert(csr, leaf)
+                except ValueError as error:
+                    raise errors.IssuanceValidationError(
+                        str(error), order_uri=orderr.uri) from error
+                orderr = orderr.update(body=body, fullchain_pem=fullchain_pem)
                 if fetch_alternative_chains:
                     alt_chains_urls = self._get_links(certificate_response, 'alternate')
-                    alt_chains = [self._post_as_get(url).text for url in alt_chains_urls]
+                    alt_chains = []
+                    for url in alt_chains_urls:
+                        alt_fullchain_pem = self._post_as_get(url).text
+                        # An alternative chain may use different intermediates,
+                        # but its leaf must be the same certificate that was
+                        # just validated; parsing each PEM alone is not enough.
+                        try:
+                            alt_leaf = crypto_util.load_fullchain_leaf(
+                                alt_fullchain_pem)
+                        except ValueError as error:
+                            raise errors.IssuanceValidationError(
+                                f"alternative chain {url} could not be parsed: "
+                                f"{error}", order_uri=orderr.uri) from error
+                        if alt_leaf.public_bytes(serialization.Encoding.DER) != \
+                                leaf.public_bytes(serialization.Encoding.DER):
+                            raise errors.IssuanceValidationError(
+                                f"alternative chain {url} replaces the leaf "
+                                "certificate with a different certificate",
+                                order_uri=orderr.uri)
+                        alt_chains.append(alt_fullchain_pem)
                     orderr = orderr.update(alternative_fullchains_pem=alt_chains)
                 return orderr
             elif body.status == messages.STATUS_PROCESSING:
@@ -295,6 +337,10 @@ class ClientV2:
 
         :returns: finalized order
         :rtype: messages.OrderResource
+
+        :raises errors.IssuanceValidationError: if the issued certificate does
+            not match the order's CSR (public key or DNS/IP identifiers), an
+            alternative chain replaces the leaf, or the PEM is incomplete
 
         """
         try:

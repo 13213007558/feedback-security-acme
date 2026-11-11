@@ -3,6 +3,7 @@ import datetime
 import typing
 from typing import Any
 from typing import Mapping
+from typing import Optional
 
 from josepy import errors as jose_errors
 import requests
@@ -131,6 +132,32 @@ class IssuanceError(Error):
         """
         self.error = error
         super().__init__()
+
+
+class IssuanceValidationError(Error):
+    """Issued certificate does not correspond to the order's CSR.
+
+    Raised when the leaf certificate returned for a finalized order cannot be
+    matched to the CSR submitted for that order (wrong public key or DNS/IP
+    identifiers), when an alternative chain replaces the leaf certificate, or
+    when the returned PEM cannot be parsed completely. This is a check of the
+    correspondence between the issuance result and the request; it does not
+    establish any CA root trust or revocation status.
+
+    :ivar str order_uri: URI of the order whose issuance result failed
+        validation, when available.
+    :ivar str detail: Human-readable description of the mismatch.
+    """
+
+    def __init__(self, detail: str, order_uri: Optional[str] = None) -> None:
+        self.detail = detail
+        self.order_uri = order_uri
+        super().__init__(detail)
+
+    def __str__(self) -> str:
+        if self.order_uri:
+            return f"Order {self.order_uri}: {self.detail}"
+        return self.detail
 
 
 class ConflictError(ClientError):
