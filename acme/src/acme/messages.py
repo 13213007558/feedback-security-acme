@@ -325,6 +325,47 @@ class ExternalAccountBinding:
         return eab.to_partial_json()
 
 
+class KeyChange(jose.JSONObjectWithFields):
+    """Inner payload of an ACME keyChange request (RFC 8555 section 7.3.5).
+
+    This object is signed by the *new* account key to form the inner JWS,
+    which is then carried as the payload of an outer JWS signed by the
+    *current* account key.
+
+    :ivar str account: The account URL ("kid") the key change applies to.
+    :ivar jose.JWK oldKey: The public key of the account being replaced.
+
+    """
+    account: str = jose.field('account')
+    oldKey: jose.JWK = jose.field('oldKey', decoder=jose.JWK.from_json)
+
+    def sign_inner_jws(self, new_key: jose.JWK, key_change_url: str,
+                       alg: jose.JWASignature = jose.RS256) -> jws.JWS:
+        """Sign this object with the new key to produce the inner JWS.
+
+        Per RFC 8555 section 7.3.5, the inner JWS:
+
+        - is signed by the new account key,
+        - carries the new public key in its "jwk" header (and no "kid"),
+        - has a "url" header equal to the server's keyChange URL, and
+        - uses the compact JWS serialization.
+
+        :param josepy.JWK new_key: The new account private key.
+        :param str key_change_url: The server's keyChange directory URL.
+        :param josepy.JWASignature alg: Algorithm to use in signing the JWS.
+
+        :returns: The inner JWS in compact serialization.
+        :rtype: `acme.jws.JWS`
+
+        """
+        return jws.JWS.sign(
+            self.json_dumps().encode(),
+            key=new_key,
+            alg=alg,
+            nonce=None,
+            url=key_change_url)
+
+
 GenericRegistration = TypeVar('GenericRegistration', bound='Registration')
 
 

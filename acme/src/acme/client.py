@@ -388,6 +388,104 @@ class ClientV2:
         """
         self._revoke(cert, rsn, self.directory['revokeCert'])
 
+    def key_change(self, new_key: jose.JWK) -> None:
+        """Roll over the account key using an ACME keyChange request.
+
+        Implements RFC 8555 section 7.3.5. The request contains two JWS
+        layers:
+
+        1. an inner JWS, signed by ``new_key``, whose payload is a
+           `.messages.KeyChange` identifying the account URL and the old
+           account key, and whose header carries the new public key as
+           "jwk";
+        2. an outer JWS, signed by the current account key held by
+           ``self.net``, whose "kid" is the current account URL and whose
+           payload is the compact-serialized inner JWS.
+
+        The certificate orders and the account itself (same account URL)
+        are unaffected; only the account key changes.
+
+        State handling:
+
+        - On a confirmed success, ``self.net.key`` and
+          ``self.net.account`` are switched to the new identity before
+          this method returns, so subsequent orders are signed with the
+          new key.
+        - On a definitive server rejection (any ACME problem document,
+          including ``badNonce`` retries that keep failing), the local
+          :class:`ClientNetwork` keeps the old key and account identity.
+        - If the request could not be delivered or no response was
+          received, the server may already have applied the change. The
+          request is *not* retried and the local identity is left
+          untouched; a `.errors.KeyChangeUncertainError` is raised.
+        - If the server confirmed the change but switching the local
+          identity failed, a `.errors.KeyChangeLocalSwitchError` is
+          raised. The server's new key is authoritative; the caller must
+          not assume the old local state still works.
+
+        :param josepy.JWK new_key: The new account private key. Must
+            differ from the current account key.
+
+        :raises ValueError: if ``new_key`` is identical to the current
+            account key, or the client has no account URL/old key.
+        :raises .messages.Error: if the server rejects the request with a
+            definitive ACME error.
+        :raises .errors.KeyChangeUncertainError: if the request outcome
+            cannot be determined because of a transport failure.
+        :raises .errors.KeyChangeLocalSwitchError: if the server accepted
+            the change but the local identity could not be switched.
+
+        """
+        old_key = self.net.key
+        account = self.net.account
+        if old_key is None:
+            raise ValueError(
+                "ClientNetwork has no account key, so keyChange cannot be signed.")
+        if account is None or not account.get('uri'):
+            raise ValueError(
+                "ClientNetwork has no account URL, so keyChange cannot be sent.")
+        if new_key == old_key:
+            raise ValueError(
+                "The new account key must be different from the current account key.")
+
+        account_url = account['uri']
+        key_change_url = self.directory['keyChange']
+
+        # Inner JWS: signed by the NEW key, proving possession of it.
+        inner_payload = messages.KeyChange(account=account_url,
+                                           oldKey=old_key.public_key())
+        inner_jws = inner_payload.sign_inner_jws(
+            new_key=new_key,
+            key_change_url=key_change_url,
+            alg=self.net.alg)
+
+        try:
+            response = self._post(key_change_url,
+                                  _RawCompactJWS(inner_jws.to_compact()))
+        except requests.exceptions.RequestException as error:
+            # The request may have reached the server and been applied
+            # before the connection was lost. Do not retry and do not
+            # touch the local identity.
+            raise errors.KeyChangeUncertainError(
+                account_url, old_key, new_key) from error
+
+        # RFC 8555: a successful keyChange returns 200 with an updated
+        # account object. Only switch the local identity after the server
+        # has confirmed the change.
+        new_regr = self._regr_from_response(response, uri=account_url,
+                                            terms_of_service=account.terms_of_service)
+
+        # Switch the key first. If anything fails below, the old key is
+        # already invalid on the server, so leaving it in place would be
+        # strictly worse.
+        self.net.key = new_key
+        try:
+            self.net.account = new_regr
+        except Exception as error:  # pylint: disable=broad-except
+            raise errors.KeyChangeLocalSwitchError(
+                account_url, old_key, new_key,
+                local_key_switched=True) from error
+
     def external_account_required(self) -> bool:
         """Checks if ACME server requires External Account Binding authentication."""
         return hasattr(self.directory, 'meta') and \
@@ -821,17 +919,104 @@ class ClientNetwork:
                 return self._post_once(*args, **kwargs)
             raise
 
+    def post_raw_jws(self, url: str, raw_payload: bytes,
+                     content_type: str = JOSE_CONTENT_TYPE,
+                     **kwargs: Any) -> requests.Response:
+        """POST a pre-serialized payload wrapped in an outer JWS.
+
+        This is used for keyChange (RFC 8555 section 7.3.5), where the
+        outer JWS payload is not a JSON object but the compact
+        serialization of the inner JWS. The outer JWS itself is still
+        signed with the current account key and account "kid".
+
+        Like :meth:`post`, a single retry is performed on ``badNonce``.
+        Transport errors are deliberately not swallowed: the caller needs
+        them to distinguish a definitive rejection from an uncertain
+        outcome.
+
+        :param str url: The URL to POST to.
+        :param bytes raw_payload: The exact bytes to place in the outer
+            JWS payload.
+        :param str content_type: Content-Type header for the request.
+
+        :returns: HTTP Response
+        :rtype: `requests.Response`
+
+        """
+        try:
+            return self._post_raw_jws_once(url, raw_payload, content_type, **kwargs)
+        except messages.Error as error:
+            if error.code == 'badNonce':
+                logger.debug('Retrying request after error:\n%s', error)
+                return self._post_raw_jws_once(url, raw_payload, content_type, **kwargs)
+            raise
+
+    def _post_raw_jws_once(self, url: str, raw_payload: bytes,
+                           content_type: str, **kwargs: Any) -> requests.Response:
+        new_nonce_url = kwargs.pop('new_nonce_url', None)
+        if not self.key:
+            raise errors.Error("acme.ClientNetwork with no private key can't POST.")
+        nonce = self._get_nonce(url, new_nonce_url)
+        assert self.key
+        outer_kwargs: dict[str, Any] = {
+            "alg": self.alg,
+            "nonce": nonce,
+            "url": url,
+            "key": self.key,
+        }
+        # keyChange is an account-authenticated request, so it carries the
+        # account "kid" and never a "jwk".
+        if self.account is not None:
+            outer_kwargs["kid"] = self.account["uri"]
+        data = jws.JWS.sign(raw_payload,
+                            **cast(Mapping[str, Any], outer_kwargs)).json_dumps(indent=2)
+        kwargs.setdefault('headers', {'Content-Type': content_type})
+        response = self._send_request('POST', url, data=data, **kwargs)
+        response = self._check_response(response, content_type=content_type)
+        self._add_nonce(response)
+        return response
+
     def _post_once(self, url: str, obj: jose.JSONDeSerializable,
                    content_type: str = JOSE_CONTENT_TYPE, **kwargs: Any) -> requests.Response:
         new_nonce_url = kwargs.pop('new_nonce_url', None)
         if not self.key:
             raise errors.Error("acme.ClientNetwork with no private key can't POST.")
+        if isinstance(obj, _RawCompactJWS):
+            return self._post_raw_jws_once(
+                url, obj.payload, content_type, new_nonce_url=new_nonce_url, **kwargs)
         data = self._wrap_in_jws(obj, self._get_nonce(url, new_nonce_url), url)
         kwargs.setdefault('headers', {'Content-Type': content_type})
         response = self._send_request('POST', url, data=data, **kwargs)
         response = self._check_response(response, content_type=content_type)
         self._add_nonce(response)
         return response
+
+
+class _RawCompactJWS(jose.JSONDeSerializable):
+    """Wrapper that posts pre-serialized bytes as the JWS payload.
+
+    The keyChange outer JWS must carry the compact serialization of the
+    inner JWS verbatim (RFC 8555 section 7.3.5), rather than a JSON
+    object. :meth:`ClientNetwork._post_once` recognizes this wrapper and
+    routes it through the raw-payload signing path.
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        if not isinstance(payload, bytes):
+            raise TypeError('Compact JWS payload must be bytes.')
+        self.payload = payload
+
+    def json_dumps(self, **kwargs: Any) -> str:
+        # Never called on the raw path; present for interface completeness.
+        return self.payload.decode('ascii')
+
+    def to_partial_json(self) -> Any:  # pragma: no cover - serialization is raw
+        return self.payload
+
+    @classmethod
+    def from_json(cls, jobj: Any) -> '_RawCompactJWS':  # pragma: no cover
+        return cls(jobj if isinstance(jobj, bytes) else str(jobj).encode('ascii'))
+
 
 def _renewal_info_path_component(cert: x509.Certificate) -> str:
     akid_ext = cert.extensions.get_extension_for_oid(x509.ExtensionOID.AUTHORITY_KEY_IDENTIFIER)

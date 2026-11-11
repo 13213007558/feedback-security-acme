@@ -5,6 +5,7 @@ from typing import Any
 from typing import Mapping
 
 from josepy import errors as jose_errors
+import josepy as jose
 import requests
 
 # We import acme.messages only during type check to avoid circular dependencies. Type references
@@ -155,3 +156,70 @@ class ARIError(ClientError):
     def __init__(self, message: str, retry_after: datetime.datetime) -> None:
         super().__init__(message, retry_after)
         self.retry_after = retry_after
+
+
+class KeyChangeError(ClientError):
+    """Base class for errors raised while rolling over an account key.
+
+    See RFC 8555 section 7.3.5.
+    """
+
+    def __init__(self, account_url: str, old_key: 'jose.JWK',
+                 new_key: 'jose.JWK', *args: Any) -> None:
+        super().__init__(*args)
+        self.account_url = account_url
+        self.old_key = old_key
+        self.new_key = new_key
+
+
+class KeyChangeUncertainError(KeyChangeError):
+    """The outcome of a keyChange request could not be determined.
+
+    Raised when the keyChange request could not be delivered, or no
+    response was received, because of a transport-level failure. The
+    server may or may not have applied the new key, so the request must
+    not be retried blindly. The local :class:`~acme.client.ClientNetwork`
+    keeps the old key and account identity until the server's state has
+    been checked out of band.
+
+    The original transport error is available through ``__cause__``.
+    """
+
+    def __str__(self) -> str:
+        return (
+            'keyChange request to {url} could not be completed: {cause}. '
+            'The server may already have accepted the new key, so the request '
+            'was not retried and the local account key was left unchanged. '
+            'Check which key the server accepts before trying again.'.format(
+                url=self.account_url,
+                cause=self.__cause__ if self.__cause__ is not None else 'no response received'))
+
+
+class KeyChangeLocalSwitchError(KeyChangeError):
+    """The server accepted the key change but the local identity could not be switched.
+
+    The server confirmed the keyChange, so the new key is authoritative on
+    the server. If the local :class:`~acme.client.ClientNetwork` could be
+    updated it already holds the new key; otherwise it still holds the old
+    key, which the server no longer accepts. Do not assume the old local
+    state is valid.
+
+    The original local failure is available through ``__cause__``.
+    """
+
+    def __init__(self, account_url: str, old_key: 'jose.JWK', new_key: 'jose.JWK',
+                 local_key_switched: bool, *args: Any) -> None:
+        super().__init__(account_url, old_key, new_key, *args)
+        self.local_key_switched = local_key_switched
+
+    def __str__(self) -> str:
+        if self.local_key_switched:
+            detail = ('the local key was switched to the new key, but updating the '
+                      'local account object failed')
+        else:
+            detail = ('neither the local key nor the local account object could be '
+                      'switched; the old local key is no longer accepted by the server')
+        return (
+            'keyChange to {url} was accepted by the server, but {detail}. '
+            'Do not assume the old local state is valid.'.format(
+                url=self.account_url, detail=detail))

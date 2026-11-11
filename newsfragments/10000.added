@@ -1,0 +1,5 @@
+Added support for RFC 8555 section 7.3.5 account key rollover via
+`ClientV2.key_change`, including the two-layer (old/new key) JWS proof,
+explicit handling of rejected, badNonce, lost-response, and local-switch
+failure cases, and a runnable keyChange demonstration under
+`acme/examples/key_change_demo`.

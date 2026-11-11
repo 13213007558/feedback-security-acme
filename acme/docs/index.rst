@@ -12,6 +12,7 @@ Contents:
    :maxdepth: 2
 
    api
+   key_change
 
 .. automodule:: acme
    :members:
