@@ -648,6 +648,113 @@ class ClientV2Test(unittest.TestCase):
         _, retry_after = self.client.renewal_time(cert_pem)
         assert retry_after == datetime.datetime(2025, 3, 15, 00, 1, 40)
 
+
+class ClientV2AccountSigningTest(unittest.TestCase):
+    """Tests that ClientV2 requests explicitly select jwk or kid signing.
+
+    These use a real ClientNetwork with a mocked transport and decode the
+    JWS protected header of every request to check which identity was
+    used to sign it.
+    """
+    # pylint: disable=protected-access
+
+    def setUp(self):
+        self.account_uri = 'https://www.letsencrypt-demo.org/acme/acct/1'
+        self.updated_account_uri = 'https://www.letsencrypt-demo.org/acme/acct/2'
+        reg = messages.Registration(
+            contact=('mailto:cert-admin@example.com',), key=KEY.public_key())
+        self.regr = messages.RegistrationResource(body=reg, uri=self.account_uri)
+        self.new_reg = messages.NewRegistration(**dict(reg))
+
+        self.net = ClientNetwork(key=KEY, alg=jose.RS256, account=self.regr)
+        self.client = ClientV2(DIRECTORY_V2, self.net)
+
+        self.nonce = jose.b64encode(b'nonce').decode()
+        self.net._nonces.add(jose.b64decode(self.nonce))
+
+        self.status_code = http_client.OK
+        self.protected_headers = []
+        self.net._send_request = mock.MagicMock(side_effect=self._record_request)
+
+    def _record_request(self, method, url, *args, **kwargs):
+        if 'data' in kwargs:
+            protected = json.loads(jose.b64decode(
+                json.loads(kwargs['data'])['protected']).decode())
+            self.protected_headers.append((url, protected))
+        response = mock.MagicMock(ok=True, status_code=self.status_code)
+        response.headers = {
+            'Replay-Nonce': self.nonce,
+            'Location': self.updated_account_uri,
+        }
+        response.links = {}
+        response.json.return_value = self.regr.body.to_json()
+        return response
+
+    def test_new_account_signs_with_jwk(self):
+        # registration must select jwk signing explicitly, even when an
+        # account is already set on the network object
+        self.status_code = http_client.CREATED
+        self.client.new_account(self.new_reg)
+        url, protected = self.protected_headers[0]
+        assert url == DIRECTORY_V2['newAccount']
+        assert 'jwk' in protected
+        assert 'kid' not in protected
+
+    def test_query_registration_failure_keeps_account(self):
+        self.net._send_request = mock.MagicMock(
+            side_effect=requests.exceptions.RequestException)
+        with pytest.raises(requests.exceptions.RequestException):
+            self.client.query_registration(self.regr)
+        assert self.net.account is self.regr
+
+    def test_query_registration_reentrant_request_keeps_kid(self):
+        reentered = []
+        record_request = self.net._send_request
+
+        def send_request(method, url, *args, **kwargs):
+            if url == DIRECTORY_V2['newAccount'] and not reentered:
+                reentered.append(True)
+                # simulate a send hook triggering another operation while
+                # the account query is still in flight
+                self.client._post_as_get('https://www.letsencrypt-demo.org/acme/authz/1')
+            return record_request(method, url, *args, **kwargs)
+
+        self.net._send_request = mock.MagicMock(side_effect=send_request)
+
+        self.client.query_registration(self.regr)
+        assert reentered
+
+        by_url = dict((url, protected) for url, protected in self.protected_headers)
+        # the query itself is signed with jwk
+        assert 'jwk' in by_url[DIRECTORY_V2['newAccount']]
+        assert 'kid' not in by_url[DIRECTORY_V2['newAccount']]
+        # the reentrant request is not affected and uses the account kid
+        authz_protected = by_url['https://www.letsencrypt-demo.org/acme/authz/1']
+        assert authz_protected['kid'] == self.account_uri
+        assert 'jwk' not in authz_protected
+
+        # requests after the query keep using the (updated) account kid
+        self.client._post_as_get('https://www.letsencrypt-demo.org/acme/authz/2')
+        _, protected = self.protected_headers[-1]
+        assert protected['kid'] == self.updated_account_uri
+        assert 'jwk' not in protected
+
+    def test_update_registration_then_next_request_uses_updated_kid(self):
+        self.client.update_registration(self.regr)
+        assert self.net.account.uri == self.updated_account_uri
+
+        query_protected = self.protected_headers[0][1]
+        assert 'jwk' in query_protected
+        assert 'kid' not in query_protected
+        update_protected = self.protected_headers[1][1]
+        assert update_protected['kid'] == self.updated_account_uri
+
+        self.client._post_as_get('https://www.letsencrypt-demo.org/acme/authz/1')
+        _, protected = self.protected_headers[-1]
+        assert protected['kid'] == self.updated_account_uri
+        assert 'jwk' not in protected
+
+
 def test_renewal_info_path_component():
     from cryptography import x509
     from acme.client import _renewal_info_path_component
@@ -754,6 +861,15 @@ class ClientNetworkTest(unittest.TestCase):
         assert jws.signature.combined.nonce == b'Tg'
         assert jws.signature.combined.kid == u'acct-uri'
         assert jws.signature.combined.url == u'url'
+
+    def test_wrap_in_jws_use_jwk(self):
+        self.net.account = {'uri': 'acct-uri'}
+        # pylint: disable=protected-access
+        jws_dump = self.net._wrap_in_jws(
+            MockJSONDeSerializable('foo'), nonce=b'Tg', url="url", use_jwk=True)
+        jws = acme_jws.JWS.json_loads(jws_dump)
+        assert jws.signature.combined.kid is None
+        assert jws.signature.combined.jwk is not None
 
     def test_check_response_not_ok_jobj_no_error(self):
         self.response.ok = False
@@ -1014,13 +1130,13 @@ class ClientNetworkWithMockedResponseTest(unittest.TestCase):
             'uri', self.obj, content_type=self.content_type)
         assert self.response.checked
         self.net._wrap_in_jws.assert_called_once_with(
-            self.obj, jose.b64decode(self.all_nonces.pop()), "uri")
+            self.obj, jose.b64decode(self.all_nonces.pop()), "uri", use_jwk=False)
 
         self.available_nonces = []
         with pytest.raises(errors.MissingNonce):
             self.net.post('uri', self.obj, content_type=self.content_type)
         self.net._wrap_in_jws.assert_called_with(
-            self.obj, jose.b64decode(self.all_nonces.pop()), "uri")
+            self.obj, jose.b64decode(self.all_nonces.pop()), "uri", use_jwk=False)
 
     def test_post_wrong_initial_nonce(self):  # HEAD
         self.available_nonces = [b'f', jose.b64encode(b'good')]

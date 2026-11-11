@@ -34,6 +34,11 @@ DEFAULT_NETWORK_TIMEOUT = 45
 class ClientV2:
     """ACME client for a v2 API.
 
+    .. note:: This class is not thread-safe. A single ``ClientV2``
+        instance (and its associated ``ClientNetwork``) must not be used
+        concurrently from multiple threads without external
+        synchronization; see `ClientNetwork` for details.
+
     :ivar messages.Directory directory:
     :ivar .ClientNetwork net: Client network.
     """
@@ -57,7 +62,7 @@ class ClientV2:
         :returns: Registration Resource.
         :rtype: `.RegistrationResource`
         """
-        response = self._post(self.directory['newAccount'], new_account)
+        response = self._post(self.directory['newAccount'], new_account, use_jwk=True)
         # if account already exists
         if response.status_code == 200 and 'Location' in response.headers:
             raise errors.ConflictError(response.headers['Location'])
@@ -102,9 +107,11 @@ class ClientV2:
 
     def _get_v2_account(self, regr: messages.RegistrationResource, update_body: bool = False
                        ) -> messages.RegistrationResource:
-        self.net.account = None
+        # The "only return existing" newAccount request must be signed
+        # with jwk rather than kid, so it explicitly selects use_jwk
+        # instead of temporarily clearing the shared network account.
         only_existing_reg = regr.body.update(only_return_existing=True)
-        response = self._post(self.directory['newAccount'], only_existing_reg)
+        response = self._post(self.directory['newAccount'], only_existing_reg, use_jwk=True)
         updated_uri = response.headers['Location']
         new_regr = regr.update(body=messages.Registration.from_json(response.json())
                                if update_body else regr.body,
@@ -592,6 +599,13 @@ class ClientNetwork:
     """Wrapper around requests that signs POSTs for authentication.
 
     Also adds user agent, and handles Content-Type.
+
+    .. note:: This class is not thread-safe. Although some individual
+        operations (such as adding or popping a nonce from the nonce
+        set) are atomic, the object as a whole carries mutable,
+        unsynchronized state (the account, the nonce pool, and the
+        underlying ``requests.Session``), so a single instance must not
+        be shared between threads without external locking.
     """
     JSON_CONTENT_TYPE = 'application/json'
     JOSE_CONTENT_TYPE = 'application/jose+json'
@@ -634,7 +648,8 @@ class ClientNetwork:
         except Exception:  # pylint: disable=broad-except
             pass
 
-    def _wrap_in_jws(self, obj: jose.JSONDeSerializable, nonce: str, url: str) -> str:
+    def _wrap_in_jws(self, obj: jose.JSONDeSerializable, nonce: str, url: str,
+                     use_jwk: bool = False) -> str:
         """Wrap `JSONDeSerializable` object in JWS.
 
         .. todo:: Implement ``acmePath``.
@@ -642,6 +657,11 @@ class ClientNetwork:
         :param josepy.JSONDeSerializable obj:
         :param str url: The URL to which this object will be POSTed
         :param str nonce:
+        :param bool use_jwk: If True, sign with the account key in the
+            ``jwk`` protected header field instead of referring to the
+            current account through ``kid``. This is required for
+            newAccount requests and must be selected explicitly by the
+            caller rather than by clearing ``self.account``.
         :rtype: str
 
         """
@@ -656,7 +676,7 @@ class ClientNetwork:
         }
         # newAccount and revokeCert work without the kid
         # newAccount must not have kid
-        if self.account is not None:
+        if self.account is not None and not use_jwk:
             kwargs["kid"] = self.account["uri"]
         return jws.JWS.sign(jobj, **cast(Mapping[str, Any], kwargs)).json_dumps(indent=2)
 
@@ -812,6 +832,9 @@ class ClientNetwork:
         If the server responded with a badNonce error, the request will
         be retried once.
 
+        Accepts the same keyword arguments as `_post_once`, including
+        `use_jwk` to explicitly select jwk instead of kid signing.
+
         """
         try:
             return self._post_once(*args, **kwargs)
@@ -822,11 +845,12 @@ class ClientNetwork:
             raise
 
     def _post_once(self, url: str, obj: jose.JSONDeSerializable,
-                   content_type: str = JOSE_CONTENT_TYPE, **kwargs: Any) -> requests.Response:
+                   content_type: str = JOSE_CONTENT_TYPE, use_jwk: bool = False,
+                   **kwargs: Any) -> requests.Response:
         new_nonce_url = kwargs.pop('new_nonce_url', None)
         if not self.key:
             raise errors.Error("acme.ClientNetwork with no private key can't POST.")
-        data = self._wrap_in_jws(obj, self._get_nonce(url, new_nonce_url), url)
+        data = self._wrap_in_jws(obj, self._get_nonce(url, new_nonce_url), url, use_jwk=use_jwk)
         kwargs.setdefault('headers', {'Content-Type': content_type})
         response = self._send_request('POST', url, data=data, **kwargs)
         response = self._check_response(response, content_type=content_type)
