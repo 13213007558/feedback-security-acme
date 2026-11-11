@@ -132,6 +132,9 @@ class IssuanceError(Error):
         self.error = error
         super().__init__()
 
+    def __str__(self) -> str:
+        return str(self.error)
+
 
 class ConflictError(ClientError):
     """Error for when the server returns a 409 (Conflict) HTTP status.

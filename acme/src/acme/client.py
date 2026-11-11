@@ -228,6 +228,26 @@ class ClientV2:
         orderr = orderr.update(body=messages.Order.from_json(res.json()))
         return orderr
 
+    def _check_polled_order(self, response: requests.Response,
+                            body: messages.Order,
+                            orderr: messages.OrderResource) -> None:
+        """Verify a polled order still describes the order being finalized.
+
+        A finalization request must only ever be sent for the order that was
+        originally created, so a server response pointing at a different order
+        URI or a different set of identifiers is treated as a protocol error
+        instead of being silently acted upon.
+        """
+        location = response.headers.get('Location')
+        if location is not None and location != orderr.uri:
+            raise errors.UnexpectedUpdate(
+                f'Order URI changed from {orderr.uri!r} to {location!r}')
+        if (body.identifiers is not None
+                and body.identifiers != orderr.body.identifiers):
+            raise errors.UnexpectedUpdate(
+                'Order identifiers changed from '
+                f'{orderr.body.identifiers!r} to {body.identifiers!r}')
+
     def poll_finalization(self, orderr: messages.OrderResource,
                           deadline: datetime.datetime,
                           fetch_alternative_chains: bool = False
@@ -238,17 +258,19 @@ class ClientV2:
 
         If a finalization request previously returned `orderNotReady`,
         poll until ready, send a new finalization request, and continue
-        polling until valid as above.
+        polling until valid as above. A CSR is only resubmitted when the
+        server reports the order is in the "ready" state, and the polled
+        order is checked to still be the order being finalized.
 
         :returns: finalized order (with certificate)
         :rtype: messages.OrderResource
         """
         sleep_seconds: float = 1
         while datetime.datetime.now() < deadline:
-            if sleep_seconds > 0:
-                time.sleep(sleep_seconds)
+            time.sleep(sleep_seconds)
             response = self._post_as_get(orderr.uri)
             body = messages.Order.from_json(response.json())
+            self._check_polled_order(response, body, orderr)
             if body.status == messages.STATUS_INVALID:
                 # "invalid": The certificate will not be issued.  Consider this
                 # order process abandoned.
@@ -259,9 +281,11 @@ class ClientV2:
                     "by the server.")
             elif body.status == messages.STATUS_READY:
                 # "ready": The server agrees that the requirements have been
-                # fulfilled, and is awaiting finalization.  Submit a finalization
-                # request.
-                self.begin_finalization(orderr)
+                # fulfilled, and is awaiting finalization.  Only resubmit the
+                # CSR on this explicit state basis, using the freshly polled
+                # order (e.g. its current finalize URL), not a stale snapshot.
+                self.begin_finalization(orderr.update(body=body))
+                orderr = orderr.update(body=body)
                 sleep_seconds = 1
             elif body.status == messages.STATUS_VALID and body.certificate is not None:
                 # "valid": The server has issued the certificate and provisioned its
@@ -277,11 +301,13 @@ class ClientV2:
             elif body.status == messages.STATUS_PROCESSING:
                 # "processing": The certificate is being issued.  Send a POST-as-GET request after
                 # the time given in the Retry-After header field of the response, if any.
-                retry_after = self.retry_after(response, 1)
+                next_poll = self.retry_after(response, 1)
                 # Whatever Retry-After the ACME server requests, the polling must not take
-                # longer than the overall deadline
-                retry_after = min(retry_after, deadline)
-                sleep_seconds = (retry_after - datetime.datetime.now()).total_seconds()
+                # longer than the overall deadline. Never poll again at or past the deadline.
+                if next_poll >= deadline:
+                    break
+                sleep_seconds = max(
+                    (next_poll - datetime.datetime.now()).total_seconds(), 1)
         raise errors.TimeoutError()
 
     def finalize_order(self, orderr: messages.OrderResource, deadline: datetime.datetime,

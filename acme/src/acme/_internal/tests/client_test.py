@@ -321,6 +321,151 @@ class ClientV2Test(unittest.TestCase):
         assert self.net.post.call_count == 6
         assert mock_sleep.call_args_list == [((1,),), ((50,),), ((1,),)]
 
+    def _order_response(self, order, retry_after=None, location=None):
+        response = copy.deepcopy(self.response)
+        response.json.return_value = order.to_json()
+        if retry_after is not None:
+            response.headers['Retry-After'] = str(retry_after)
+        if location is not None:
+            response.headers['Location'] = location
+        return response
+
+    def test_poll_finalization_rejects_changed_order_uri(self):
+        processing = self.order.update(status=messages.STATUS_PROCESSING)
+        ready = self.order.update(status=messages.STATUS_READY)
+        foreign_uri = 'https://www.letsencrypt-demo.org/acme/acct/9/order/77'
+        post = mock.MagicMock()
+        post.side_effect = [
+            self._order_response(processing),
+            self._order_response(ready, location=foreign_uri),
+        ]
+        self.net.post = post
+
+        with pytest.raises(errors.UnexpectedUpdate, match='Order URI changed'):
+            self.client.finalize_order(self.orderr, datetime.datetime(9999, 9, 9))
+        # Only the initial finalize and the single poll happened: no CSR is
+        # resubmitted for an order whose identity no longer matches.
+        assert post.call_count == 2
+        assert sum('finalize' in call.args[0] for call in post.call_args_list) == 1
+
+    def test_poll_finalization_rejects_changed_identifiers(self):
+        processing = self.order.update(status=messages.STATUS_PROCESSING)
+        foreign = self.order.update(
+            status=messages.STATUS_READY,
+            identifiers=(messages.Identifier(
+                typ=messages.IDENTIFIER_FQDN, value='attacker.example'),))
+        post = mock.MagicMock()
+        post.side_effect = [
+            self._order_response(processing),
+            self._order_response(foreign),
+        ]
+        self.net.post = post
+
+        with pytest.raises(errors.UnexpectedUpdate, match='identifiers changed'):
+            self.client.finalize_order(self.orderr, datetime.datetime(9999, 9, 9))
+        assert post.call_count == 2
+        assert sum('finalize' in call.args[0] for call in post.call_args_list) == 1
+
+    def test_poll_finalization_uses_polled_finalize_url_on_ready(self):
+        new_finalize = ('https://www.letsencrypt-demo.org/acme/acct/1/order/1/'
+                        'finalize-new')
+        processing = self.order.update(status=messages.STATUS_PROCESSING)
+        ready = self.order.update(
+            status=messages.STATUS_READY, finalize=new_finalize)
+        valid = self.order.update(
+            certificate='https://www.letsencrypt-demo.org/acme/cert/',
+            status=messages.STATUS_VALID)
+        self.response.text = CERT_SAN_PEM
+        post = mock.MagicMock()
+        post.side_effect = [
+            self._order_response(processing),
+            self._order_response(ready),
+            mock.MagicMock(),  # second begin_finalization
+            self._order_response(valid),
+            self.response,  # certificate download
+        ]
+        self.net.post = post
+
+        self.client.finalize_order(self.orderr, datetime.datetime(9999, 9, 9))
+        finalize_urls = [call.args[0] for call in post.call_args_list
+                         if 'finalize' in call.args[0]]
+        assert finalize_urls == [self.order.finalize, new_finalize]
+
+    @mock.patch('acme.client.time.sleep')
+    @mock.patch('acme.client.datetime')
+    def test_poll_finalization_retry_after_beyond_deadline(
+            self, dt_mock, mock_sleep):
+        now = datetime.datetime(2026, 11, 11, 10, 0, 0)
+        deadline = now + datetime.timedelta(seconds=90)
+        dt_mock.datetime.now.return_value = now
+        dt_mock.timedelta = datetime.timedelta
+        processing = self.order.update(status=messages.STATUS_PROCESSING)
+        post = mock.MagicMock()
+        post.side_effect = [
+            self._order_response(processing),
+            self._order_response(processing, retry_after=500),
+        ]
+        self.net.post = post
+
+        with pytest.raises(errors.TimeoutError):
+            self.client.finalize_order(self.orderr, deadline)
+        # The beyond-deadline Retry-After must not produce another request:
+        # one initial finalize plus one processing poll only.
+        assert post.call_count == 2
+        mock_sleep.assert_called_once_with(1)
+
+    @mock.patch('acme.client.time.sleep')
+    @mock.patch('acme.client.datetime')
+    def test_poll_finalization_negative_retry_after_no_busy_loop(
+            self, dt_mock, mock_sleep):
+        start = datetime.datetime(2026, 11, 11, 10, 0, 0)
+        deadline = start + datetime.timedelta(seconds=3)
+        current = start
+
+        def fake_now():
+            return current
+
+        def fake_sleep(seconds):
+            nonlocal current
+            current += datetime.timedelta(seconds=seconds)
+
+        dt_mock.datetime.now.side_effect = fake_now
+        dt_mock.timedelta = datetime.timedelta
+        mock_sleep.side_effect = fake_sleep
+        processing = self.order.update(status=messages.STATUS_PROCESSING)
+        post = mock.MagicMock()
+        post.side_effect = [self._order_response(processing)] + [
+            self._order_response(processing, retry_after=-10)
+            for _ in range(10)]
+        self.net.post = post
+
+        with pytest.raises(errors.TimeoutError):
+            self.client.finalize_order(self.orderr, deadline)
+        # Initial 1s wait, then one 1s poll per second up to the 3s deadline.
+        assert mock_sleep.call_args_list == [mock.call(1), mock.call(1),
+                                             mock.call(1)]
+
+    def test_finalize_order_issuance_error_preserves_server_error(self):
+        server_error = messages.Error.with_code(
+            'serverInternal', detail='CA boom while issuing')
+        invalid = self.order.update(
+            status=messages.STATUS_INVALID, error=server_error)
+        post = mock.MagicMock()
+        post.side_effect = [
+            self._order_response(self.order.update(
+                status=messages.STATUS_PROCESSING)),
+            self._order_response(invalid),
+        ]
+        self.net.post = post
+
+        with pytest.raises(errors.IssuanceError) as exc_info:
+            self.client.finalize_order(self.orderr, datetime.datetime(9999, 9, 9))
+        assert exc_info.value.error == server_error
+        assert exc_info.value.error.typ == server_error.typ
+        assert exc_info.value.error.detail == server_error.detail
+        assert 'serverInternal' in str(exc_info.value)
+        assert 'CA boom while issuing' in str(exc_info.value)
+
     def test_finalize_order_otherErrorCode(self):
         post = mock.MagicMock()
         post.side_effect = [messages.Error.with_code('serverInternal')]
